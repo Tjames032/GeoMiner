@@ -1,0 +1,1005 @@
+<!DOCTYPE html>
+<!--
+  GeoMiner — a global mineral-deposit map explorer.
+  Single file: HTML + CSS + vanilla JS. Leaflet 1.9.4 from CDN.
+
+  This build adds an animated intro/landing screen ("#intro") that sits over the
+  map on load and hands off to it when the visitor clicks "Enter the map".
+  The map viewer below is the existing GeoView tool, rebranded — its coordinate,
+  pin, search, elevation and base-layer features are unchanged and ready to be
+  extended with real mineral-deposit data over the coming iterations.
+
+  Choices / assumptions (unchanged from the viewer):
+  • Pins are anchored at their exact centre (a rotated square, surveyor-style).
+  • On touch devices the coordinate panel updates on tap; zoom buttons are hidden.
+  • BNG uses a single Helmert transform (WGS84 → OSGB36), ~±5 m — coursework grade.
+  • Nominatim requests are debounced (600 ms, min 3 chars, max 5 results).
+  • Crosshair guides (toggle X) follow the cursor — desktop only.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GeoMiner</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<style>
+  :root{
+    --panel: rgba(252,252,250,.85);
+    --ink: #1d2528;
+    --ink2: #5a6b70;
+    --line: rgba(29,37,40,.22);
+    --accent: #0e6b58;
+    --accent-dark: #0a5041;
+    --danger: #a3341f;
+    --mono: ui-monospace,"SF Mono","Cascadia Mono","Roboto Mono",Menlo,Consolas,monospace;
+    --sans: system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{font-family:var(--sans);color:var(--ink)}
+  #map{position:fixed;inset:0;background:#dfe6e3}
+
+  /* ---------- shared panel look: hairline border, blur, sharp corners ---- */
+  .panel{
+    position:fixed;z-index:1000;
+    background:var(--panel);
+    -webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);
+    border:1px solid var(--line);
+    border-radius:2px;
+    box-shadow:0 1px 4px rgba(29,37,40,.12);
+    font-size:13px;
+  }
+  :focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  button{font:inherit;color:inherit;background:none;border:none;cursor:pointer;padding:0}
+
+  /* ---------- search (top-left) ---------- */
+  #search{top:10px;left:56px;width:300px}
+  #search .brand{
+    display:flex;justify-content:space-between;align-items:baseline;
+    padding:6px 10px 0;
+  }
+  #search .brand b{
+    font-family:var(--mono);font-size:11px;letter-spacing:.18em;
+    color:var(--accent);font-weight:600;
+  }
+  #search .brand span{font-size:10px;color:var(--ink2)}
+  #search input{
+    width:100%;border:none;background:transparent;
+    font:inherit;color:var(--ink);
+    padding:7px 10px 8px;
+  }
+  #search input::placeholder{color:var(--ink2)}
+  #results{list-style:none;margin:0;padding:0;border-top:1px solid var(--line)}
+  #results:empty{border-top:none}
+  #results li{
+    padding:7px 10px;cursor:pointer;border-bottom:1px solid rgba(29,37,40,.08);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  }
+  #results li:last-child{border-bottom:none}
+  #results li:hover,#results li[aria-selected="true"]{background:rgba(14,107,88,.10)}
+  #results li .type{color:var(--ink2);font-size:11px;margin-left:6px}
+  #results li.msg{color:var(--ink2);cursor:default}
+
+  /* ---------- layer switcher (top-right) ---------- */
+  #layers{top:10px;right:10px;width:190px;padding:6px}
+  #layers .head{
+    font-size:10px;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--ink2);padding:2px 4px 6px;
+  }
+  #layers button{
+    display:flex;justify-content:space-between;align-items:center;
+    width:100%;text-align:left;
+    padding:6px 8px;border:1px solid transparent;border-radius:2px;
+    font-size:12.5px;
+  }
+  #layers button .key{
+    font-family:var(--mono);font-size:10px;color:var(--ink2);
+    border:1px solid var(--line);border-radius:2px;padding:0 4px;
+  }
+  #layers button:hover{background:rgba(29,37,40,.06)}
+  #layers button[aria-pressed="true"]{
+    background:var(--accent);color:#fff;border-color:var(--accent-dark);
+  }
+  #layers button[aria-pressed="true"] .key{color:rgba(255,255,255,.8);border-color:rgba(255,255,255,.45)}
+
+  /* ---------- coordinate readout (bottom-left) ---------- */
+  #coords{left:10px;bottom:10px;width:280px}
+  #coords .row{
+    display:flex;align-items:baseline;gap:8px;
+    padding:6px 10px;cursor:copy;
+    border-bottom:1px solid rgba(29,37,40,.08);
+  }
+  #coords .row:hover{background:rgba(14,107,88,.08)}
+  #coords .row .lab{
+    flex:0 0 34px;font-size:10px;letter-spacing:.1em;color:var(--ink2);
+  }
+  #coords .row .val{
+    font-family:var(--mono);font-size:12.5px;white-space:nowrap;
+  }
+  #coords .row .val.na{color:var(--ink2)}
+  #coords .foot{
+    display:none;justify-content:space-between;align-items:center;
+    padding:5px 10px;font-size:11px;color:var(--ink2);
+  }
+  #coords .foot.show{display:flex}
+  #coords .foot button{
+    color:var(--danger);font-size:11px;letter-spacing:.04em;
+  }
+  #coords .foot button:hover{text-decoration:underline}
+  #toast{
+    position:absolute;top:-26px;left:0;
+    background:var(--ink);color:#fff;font-size:11px;
+    padding:3px 8px;border-radius:2px;opacity:0;transition:opacity .15s;
+    pointer-events:none;
+  }
+  #toast.show{opacity:1}
+
+  /* ---------- help (bottom-right) ---------- */
+  #helpBtn{
+    position:fixed;right:10px;bottom:78px;z-index:1000;
+    width:26px;height:26px;
+    background:var(--panel);border:1px solid var(--line);border-radius:2px;
+    -webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);
+    font-family:var(--mono);font-size:13px;color:var(--ink2);
+    display:flex;align-items:center;justify-content:center;
+  }
+  #helpBtn:hover{color:var(--accent);border-color:var(--accent)}
+  #help{right:10px;bottom:112px;width:290px;padding:10px 12px;display:none}
+  #help.open{display:block}
+  #help h2{
+    margin:0 0 8px;font-size:11px;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--ink2);font-weight:600;
+    display:flex;justify-content:space-between;
+  }
+  #help h2 button{color:var(--ink2);font-size:13px;line-height:1}
+  #help table{border-collapse:collapse;width:100%}
+  #help td{padding:3px 0;vertical-align:top;font-size:12px}
+  #help td:first-child{width:52px}
+  #help kbd{
+    font-family:var(--mono);font-size:10.5px;
+    border:1px solid var(--line);border-radius:2px;padding:0 4px;
+    background:rgba(29,37,40,.04);
+  }
+  #help p{margin:8px 0 0;font-size:11px;color:var(--ink2);line-height:1.45}
+
+  /* ---------- crosshair guides ---------- */
+  .ch{position:fixed;z-index:900;background:rgba(29,37,40,.35);pointer-events:none;display:none}
+  #chH{height:1px;left:0;right:0}
+  #chV{width:1px;top:0;bottom:0}
+  body.ch-on.ch-active #chH,body.ch-on.ch-active #chV{display:block}
+
+  /* ---------- pins & popups ---------- */
+  .pin{
+    width:14px;height:14px;transform:rotate(45deg);
+    border:2px solid var(--accent);background:rgba(14,107,88,.18);
+    box-shadow:0 0 0 1.5px #fff;
+  }
+  .leaflet-popup-content-wrapper{
+    border-radius:2px;background:var(--panel);
+    -webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);
+    border:1px solid var(--line);box-shadow:0 1px 4px rgba(29,37,40,.15);
+  }
+  .leaflet-popup-content{margin:8px 10px;font-family:var(--sans)}
+  .pop .row{display:flex;gap:8px;padding:3px 0;cursor:copy;align-items:baseline}
+  .pop .row:hover .val{color:var(--accent)}
+  .pop .lab{flex:0 0 34px;font-size:10px;letter-spacing:.1em;color:var(--ink2)}
+  .pop .val{font-family:var(--mono);font-size:12px;white-space:nowrap}
+  .pop .elev{color:var(--ink2)}
+  .leaflet-popup-tip{background:var(--panel);border:1px solid var(--line)}
+  .leaflet-container a.leaflet-popup-close-button{color:var(--ink2)}
+
+  /* ---------- leaflet chrome to match ---------- */
+  .leaflet-bar{border:1px solid var(--line);border-radius:2px;box-shadow:0 1px 4px rgba(29,37,40,.12)}
+  .leaflet-bar a{border-radius:0 !important;color:var(--ink)}
+  .leaflet-control-scale-line{
+    background:var(--panel);border-color:var(--ink2);color:var(--ink);
+    font-family:var(--mono);font-size:10px;
+  }
+  .leaflet-control-attribution{
+    background:rgba(252,252,250,.75);font-size:10px;color:var(--ink2);
+  }
+
+  /* ============================================================= */
+  /* ==================  GeoMiner intro screen  ================== */
+  /* ============================================================= */
+  #intro{
+    position:fixed;inset:0;z-index:2000;
+    display:flex;align-items:center;justify-content:center;
+    overflow:hidden;color:#eef3f1;font-family:var(--sans);
+    background:
+      radial-gradient(1200px 820px at 50% 38%, #12211f 0%, #0b1517 55%, #060c0e 100%);
+  }
+  #globe{position:absolute;inset:0;z-index:1}
+  /* darken the centre band so the wordmark stays legible over the globe */
+  #introScrim{
+    position:absolute;inset:0;z-index:2;pointer-events:none;
+    background:
+      radial-gradient(58% 42% at 50% 46%, rgba(6,11,13,.80) 0%, rgba(6,11,13,.42) 46%, rgba(6,11,13,0) 74%),
+      linear-gradient(to bottom, rgba(6,12,14,.55) 0%, rgba(6,12,14,0) 26%, rgba(6,12,14,0) 68%, rgba(6,12,14,.7) 100%);
+  }
+  #introContent{
+    position:relative;z-index:3;
+    width:min(700px,92vw);text-align:center;padding:24px;
+  }
+  #introContent .eyebrow{
+    margin:0 0 20px;
+    font-family:var(--mono);font-size:11px;letter-spacing:.36em;
+    text-transform:uppercase;color:#5fd6b8;
+  }
+  #introContent h1{
+    margin:0;
+    font-size:clamp(50px,10.5vw,108px);font-weight:600;
+    letter-spacing:-.025em;line-height:.96;
+    background:linear-gradient(100deg,#7fe9cf 0%,#ffffff 36%,#f5c96b 64%,#7fe9cf 100%);
+    background-size:220% auto;
+    -webkit-background-clip:text;background-clip:text;
+    -webkit-text-fill-color:transparent;color:transparent;
+    opacity:0;
+    animation:gmUp .95s cubic-bezier(.2,.7,.2,1) .30s forwards,
+              gmShimmer 9s linear infinite 1.4s;
+  }
+  #introContent .sub{
+    margin:22px auto 0;max-width:48ch;
+    font-size:clamp(14px,1.7vw,17px);line-height:1.62;color:#a9bcb8;
+  }
+  #introContent .cta{
+    margin-top:36px;
+    display:inline-flex;align-items:center;gap:12px;
+    padding:14px 28px;
+    font-size:15px;font-weight:600;letter-spacing:.01em;color:#04140f;
+    background:linear-gradient(180deg,#63d9b8,#22a888);
+    border:1px solid rgba(127,233,207,.55);border-radius:4px;
+    box-shadow:0 10px 30px -8px rgba(20,110,92,.6);
+    cursor:pointer;position:relative;overflow:hidden;
+    transition:transform .25s ease, box-shadow .35s ease;
+  }
+  #introContent .cta:hover{
+    transform:translateY(-2px);
+    box-shadow:0 0 32px -4px rgba(63,217,180,.5), 0 16px 42px -10px rgba(20,110,92,.7);
+  }
+  #introContent .cta:active{transform:translateY(0)}
+  #introContent .cta .arrow{transition:transform .25s ease}
+  #introContent .cta:hover .arrow{transform:translateX(4px)}
+  #introContent .cta::after{   /* diagonal sheen sweep on hover */
+    content:"";position:absolute;top:0;left:-60%;width:42%;height:100%;
+    background:linear-gradient(100deg,transparent,rgba(255,255,255,.5),transparent);
+    transform:skewX(-18deg);transition:left .6s ease;
+  }
+  #introContent .cta:hover::after{left:130%}
+  #introContent .chips{
+    margin-top:28px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap;
+  }
+  #introContent .chips span{
+    font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;
+    color:#93aaa4;padding:5px 12px;
+    border:1px solid rgba(147,170,164,.26);border-radius:100px;
+    background:rgba(255,255,255,.02);
+  }
+  #introHint{
+    position:absolute;left:0;right:0;bottom:26px;z-index:3;text-align:center;
+    font-family:var(--mono);font-size:10.5px;letter-spacing:.24em;text-transform:uppercase;
+    color:rgba(160,184,178,.5);
+  }
+
+  /* staggered entrance */
+  @keyframes gmUp{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
+  @keyframes gmShimmer{to{background-position:220% center}}
+  #intro .anim{opacity:0;animation:gmUp .95s cubic-bezier(.2,.7,.2,1) forwards}
+  #intro .d1{animation-delay:.15s}
+  #intro .d3{animation-delay:.50s}
+  #intro .d4{animation-delay:.68s}
+  #intro .d5{animation-delay:.86s}
+
+  /* exit: fade + gentle zoom + blur, then removed by JS */
+  #intro.leaving{
+    opacity:0;transform:scale(1.045);filter:blur(7px);
+    transition:opacity .72s ease, transform .72s ease, filter .72s ease;
+    pointer-events:none;
+  }
+
+  @media (prefers-reduced-motion: reduce){
+    *{transition:none !important}
+    #intro .anim,#introContent h1{animation:none !important;opacity:1 !important}
+  }
+  /* ---------- touch devices ---------- */
+  @media (pointer: coarse){
+    .leaflet-control-zoom{display:none}
+    #search{left:10px;width:calc(100vw - 230px);max-width:300px}
+    #coords{width:250px}
+    #coords .row .val{font-size:11.5px}
+  }
+  @media (max-width: 560px){
+    #search{width:calc(100vw - 20px);max-width:none;left:10px;top:10px}
+    #layers{top:auto;bottom:150px;right:10px;width:160px}
+    #coords{width:calc(100vw - 20px)}
+    #introContent .chips{gap:7px}
+  }
+</style>
+</head>
+<body class="ch-on">
+
+<!-- ===================== GeoMiner intro ===================== -->
+<div id="intro" role="dialog" aria-modal="true" aria-label="GeoMiner — introduction">
+  <canvas id="globe" aria-hidden="true"></canvas>
+  <div id="introScrim" aria-hidden="true"></div>
+  <div id="introContent">
+    <p class="eyebrow anim d1">Global mineral deposit explorer</p>
+    <h1>GeoMiner</h1>
+    <p class="sub anim d3">Explore mineral deposit sites across the world. Drop a pin
+       on any find to read its precise coordinates, elevation and the terrain beneath it.</p>
+    <button id="enterMap" class="cta anim d4" type="button">
+      Enter the map <span class="arrow" aria-hidden="true">&rarr;</span>
+    </button>
+    <div class="chips anim d5">
+      <span>Worldwide coverage</span>
+      <span>Precise coordinates</span>
+      <span>Elevation &amp; terrain</span>
+    </div>
+  </div>
+  <div id="introHint" class="anim d5" aria-hidden="true">Press Enter to begin</div>
+</div>
+
+<div id="map" role="application" aria-label="Interactive map"></div>
+
+<!-- crosshair guides (desktop) -->
+<div id="chH" class="ch" aria-hidden="true"></div>
+<div id="chV" class="ch" aria-hidden="true"></div>
+
+<!-- search -->
+<div id="search" class="panel">
+  <div class="brand"><b>GEOMINER</b><span>press / to search</span></div>
+  <input id="q" type="search" placeholder="Search place, deposit, feature…"
+         autocomplete="off" spellcheck="false" aria-label="Search for a location">
+  <ul id="results" role="listbox" aria-label="Search results"></ul>
+</div>
+
+<!-- base layers -->
+<nav id="layers" class="panel" aria-label="Base layer switcher">
+  <div class="head">Base layer</div>
+</nav>
+
+<!-- live coordinates -->
+<div id="coords" class="panel" aria-live="off">
+  <div id="toast" role="status">Copied</div>
+  <div class="row" data-copy="dd" title="Click to copy">
+    <span class="lab">DD</span><span class="val" id="vDD">— move cursor over map</span>
+  </div>
+  <div class="row" data-copy="dms" title="Click to copy">
+    <span class="lab">DMS</span><span class="val" id="vDMS">—</span>
+  </div>
+  <div class="row" data-copy="bng" title="Click to copy">
+    <span class="lab">BNG</span><span class="val" id="vBNG">—</span>
+  </div>
+  <div class="foot" id="pinFoot">
+    <span id="pinCount">0 pins</span>
+    <button id="clearPins" type="button">Clear pins</button>
+  </div>
+</div>
+
+<!-- help -->
+<button id="helpBtn" type="button" aria-label="Help and keyboard shortcuts" aria-expanded="false">?</button>
+<div id="help" class="panel" role="dialog" aria-label="Help">
+  <h2>Shortcuts <button id="helpClose" type="button" aria-label="Close help">✕</button></h2>
+  <table>
+    <tr><td><kbd>1</kbd>–<kbd>5</kbd></td><td>Switch base layer</td></tr>
+    <tr><td><kbd>/</kbd></td><td>Focus the search box</td></tr>
+    <tr><td><kbd>C</kbd></td><td>Clear all pins</td></tr>
+    <tr><td><kbd>X</kbd></td><td>Toggle crosshair guides</td></tr>
+    <tr><td><kbd>+</kbd> <kbd>−</kbd></td><td>Zoom in / out</td></tr>
+    <tr><td><kbd>?</kbd></td><td>Show / hide this panel</td></tr>
+    <tr><td><kbd>Esc</kbd></td><td>Close panels and popups</td></tr>
+  </table>
+  <p>Click the map to drop a pin — its popup shows all coordinate formats plus
+     elevation. Click any coordinate row (panel or popup) to copy it.
+     On touch screens, tapping the map updates the readout and drops a pin.</p>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script>
+"use strict";
+
+/* ================= map & base layers ================= */
+
+const REDUCED = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const TOUCH   = matchMedia("(pointer: coarse)").matches;
+let introActive = true;                     // true while the intro screen is showing
+
+const map = L.map("map", {
+  center: [54.5, -3.0],          // over Great Britain so the BNG readout is live immediately
+  zoom: 6,
+  zoomControl: !TOUCH,           // pinch-zoom replaces buttons on touch devices
+  attributionControl: true,
+});
+map.attributionControl.setPrefix(false);
+
+const BASE_LAYERS = [
+  { name: "OpenStreetMap", key: "1",
+    url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    opts: { maxZoom: 19,
+      attribution: "&copy; <a href='https://www.openstreetmap.org/copyright'>OpenStreetMap</a> contributors" } },
+  { name: "OpenTopoMap", key: "2",
+    url: "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+    opts: { maxZoom: 17, subdomains: "abc",
+      attribution: "Map data: &copy; OpenStreetMap contributors, SRTM | Style: &copy; <a href='https://opentopomap.org'>OpenTopoMap</a> (CC-BY-SA)" } },
+  { name: "Esri World Imagery", key: "3",
+    url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    opts: { maxZoom: 19,
+      attribution: "Imagery &copy; Esri, Maxar, Earthstar Geographics, and the GIS User Community" } },
+  { name: "Esri Shaded Relief", key: "4",
+    url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Shaded_Relief/MapServer/tile/{z}/{y}/{x}",
+    opts: { maxZoom: 13,
+      attribution: "Shaded relief &copy; Esri, USGS" } },
+  { name: "CartoDB Positron", key: "5",
+    url: "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+    opts: { maxZoom: 20, subdomains: "abcd",
+      attribution: "&copy; OpenStreetMap contributors &copy; <a href='https://carto.com/attributions'>CARTO</a>" } },
+];
+
+let activeLayer = null;
+const layerButtons = [];
+const layersPanel = document.getElementById("layers");
+
+BASE_LAYERS.forEach((def, i) => {
+  def.layer = L.tileLayer(def.url, def.opts);
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.setAttribute("aria-pressed", "false");
+  btn.innerHTML = `<span>${def.name}</span><span class="key">${def.key}</span>`;
+  btn.addEventListener("click", () => setBaseLayer(i));
+  layersPanel.appendChild(btn);
+  layerButtons.push(btn);
+});
+
+function setBaseLayer(i) {
+  BASE_LAYERS.forEach((def, j) => {
+    layerButtons[j].setAttribute("aria-pressed", String(i === j));
+    if (i === j) return;
+    if (map.hasLayer(def.layer)) map.removeLayer(def.layer);
+  });
+  const def = BASE_LAYERS[i];
+  if (!map.hasLayer(def.layer)) def.layer.addTo(map);
+  activeLayer = def;
+  // Keep the map's zoom ceiling in step with the layer so we never show grey tiles
+  map.setMaxZoom(def.opts.maxZoom);
+  if (map.getZoom() > def.opts.maxZoom) map.setZoom(def.opts.maxZoom);
+}
+setBaseLayer(0);
+
+L.control.scale({ position: "bottomright", metric: true, imperial: true }).addTo(map);
+
+/* ================= coordinate conversions ================= */
+
+const toRad = d => d * Math.PI / 180;
+
+// Decimal degrees, 5 dp (≈1 m at UK latitudes)
+function fmtDD(lat, lng) {
+  return lat.toFixed(5) + ", " + lng.toFixed(5);
+}
+
+// Degrees, minutes, seconds with hemisphere letters.
+// Rounds seconds to 2 dp and carries 60.00″ → +1′ (and 60′ → +1°).
+function fmtDMSPart(v, isLat) {
+  const hemi = isLat ? (v < 0 ? "S" : "N") : (v < 0 ? "W" : "E");
+  const abs = Math.abs(v);
+  let d = Math.floor(abs);
+  let m = Math.floor((abs - d) * 60);
+  let s = Math.round(((abs - d) * 60 - m) * 60 * 100) / 100;
+  if (s >= 60) { s -= 60; m += 1; }
+  if (m >= 60) { m -= 60; d += 1; }
+  return d + "° " + String(m).padStart(2, "0") + "′ " +
+         s.toFixed(2).padStart(5, "0") + "″ " + hemi;
+}
+function fmtDMS(lat, lng) {
+  return fmtDMSPart(lat, true) + "  " + fmtDMSPart(lng, false);
+}
+
+/*
+  WGS84 → OSGB36 National Grid.
+  Method (per OS booklet "A guide to coordinate systems in Great Britain"):
+    1. lat/lon on the WGS84 ellipsoid → 3-D Cartesian (x,y,z)
+    2. 7-parameter Helmert transformation → OSGB36 datum
+    3. Cartesian → lat/lon on the Airy 1830 ellipsoid (iterative)
+    4. Transverse Mercator projection → easting/northing
+  A single Helmert shift is accurate to ~5 m nationwide, which is plenty
+  for a grid reference read to the nearest metre.
+*/
+function wgs84ToOSGB(lat, lng) {
+  // --- 1. geodetic → Cartesian on WGS84 (a, b in metres) ---
+  const phi = toRad(lat), lam = toRad(lng);
+  const aW = 6378137.0, bW = 6356752.3141;
+  const e2W = 1 - (bW * bW) / (aW * aW);            // first eccentricity²
+  const sinPhi = Math.sin(phi), cosPhi = Math.cos(phi);
+  const nu = aW / Math.sqrt(1 - e2W * sinPhi * sinPhi); // prime-vertical radius
+  let x = nu * cosPhi * Math.cos(lam);
+  let y = nu * cosPhi * Math.sin(lam);
+  let z = (1 - e2W) * nu * sinPhi;
+
+  // --- 2. Helmert: WGS84 → OSGB36 (tx ty tz in m, r* in radians, s unitless) ---
+  const tx = -446.448, ty = 125.157, tz = -542.060;
+  const rx = toRad(-0.1502 / 3600), ry = toRad(-0.2470 / 3600), rz = toRad(-0.8421 / 3600);
+  const s = 20.4894e-6;
+  const x2 = tx + (1 + s) * x - rz * y + ry * z;
+  const y2 = ty + rz * x + (1 + s) * y - rx * z;
+  const z2 = tz - ry * x + rx * y + (1 + s) * z;
+
+  // --- 3. Cartesian → geodetic on Airy 1830 (iterate latitude) ---
+  const a = 6377563.396, b = 6356256.909;
+  const e2 = 1 - (b * b) / (a * a);
+  const p = Math.sqrt(x2 * x2 + y2 * y2);
+  let phi2 = Math.atan2(z2, p * (1 - e2));
+  for (let i = 0; i < 10; i++) {
+    const nu2 = a / Math.sqrt(1 - e2 * Math.sin(phi2) ** 2);
+    phi2 = Math.atan2(z2 + e2 * nu2 * Math.sin(phi2), p);
+  }
+  const lam2 = Math.atan2(y2, x2);
+
+  // --- 4. Transverse Mercator → easting/northing (National Grid constants) ---
+  const F0 = 0.9996012717;                 // scale factor on central meridian
+  const phi0 = toRad(49), lam0 = toRad(-2); // true origin 49°N 2°W
+  const E0 = 400000, N0 = -100000;          // false origin offsets
+  const n = (a - b) / (a + b);
+
+  const sP = Math.sin(phi2), cP = Math.cos(phi2), tP = Math.tan(phi2);
+  const nu3  = a * F0 / Math.sqrt(1 - e2 * sP * sP);
+  const rho  = a * F0 * (1 - e2) / Math.pow(1 - e2 * sP * sP, 1.5);
+  const eta2 = nu3 / rho - 1;
+
+  // meridional arc M
+  const dPhi = phi2 - phi0, sPhi = phi2 + phi0;
+  const M = b * F0 * (
+      (1 + n + 5 / 4 * n * n + 5 / 4 * n ** 3) * dPhi
+    - (3 * n + 3 * n * n + 21 / 8 * n ** 3) * Math.sin(dPhi) * Math.cos(sPhi)
+    + (15 / 8 * n * n + 15 / 8 * n ** 3) * Math.sin(2 * dPhi) * Math.cos(2 * sPhi)
+    - (35 / 24 * n ** 3) * Math.sin(3 * dPhi) * Math.cos(3 * sPhi)
+  );
+
+  const I    = M + N0;
+  const II   = nu3 / 2 * sP * cP;
+  const III  = nu3 / 24 * sP * cP ** 3 * (5 - tP * tP + 9 * eta2);
+  const IIIA = nu3 / 720 * sP * cP ** 5 * (61 - 58 * tP * tP + tP ** 4);
+  const IV   = nu3 * cP;
+  const V    = nu3 / 6 * cP ** 3 * (nu3 / rho - tP * tP);
+  const VI   = nu3 / 120 * cP ** 5 * (5 - 18 * tP * tP + tP ** 4 + 14 * eta2 - 58 * tP * tP * eta2);
+
+  const dL = lam2 - lam0;
+  return {
+    easting:  E0 + IV * dL + V * dL ** 3 + VI * dL ** 5,
+    northing: I + II * dL ** 2 + III * dL ** 4 + IIIA * dL ** 6,
+  };
+}
+
+// Easting/northing → "SU 71234 82345" (5-digit = 1 m precision).
+// Returns null outside the grid's valid extent.
+function osgbGridRef(E, N) {
+  if (!isFinite(E) || !isFinite(N)) return null;
+  if (E < 0 || E >= 700000 || N < 0 || N >= 1300000) return null;
+
+  const e100k = Math.floor(E / 100000);   // which 100 km column
+  const n100k = Math.floor(N / 100000);   // which 100 km row
+
+  // Letter pair: the grid is lettered on a 5×5 pattern (A–Z minus I),
+  // first letter = 500 km square, second = 100 km square within it.
+  let l1 = (19 - n100k) - (19 - n100k) % 5 + Math.floor((e100k + 10) / 5);
+  let l2 = ((19 - n100k) * 5) % 25 + e100k % 5;
+  if (l1 > 7) l1++;                       // skip the letter I
+  if (l2 > 7) l2++;
+  const letters = String.fromCharCode(65 + l1) + String.fromCharCode(65 + l2);
+
+  const e = String(Math.floor(E % 100000)).padStart(5, "0");
+  const n = String(Math.floor(N % 100000)).padStart(5, "0");
+  return letters + " " + e + " " + n;
+}
+
+function fmtBNG(lat, lng) {
+  const { easting, northing } = wgs84ToOSGB(lat, lng);
+  return osgbGridRef(easting, northing);   // null → caller shows "Outside BNG area"
+}
+
+/* ================= live readout, crosshair, copy ================= */
+
+const vDD  = document.getElementById("vDD");
+const vDMS = document.getElementById("vDMS");
+const vBNG = document.getElementById("vBNG");
+const toast = document.getElementById("toast");
+const chH = document.getElementById("chH");
+const chV = document.getElementById("chV");
+
+// current values backing the copy actions (null = nothing to copy)
+const current = { dd: null, dms: null, bng: null };
+
+function updateReadout(latlng) {
+  const { lat, lng } = latlng;
+  current.dd  = fmtDD(lat, lng);
+  current.dms = fmtDMS(lat, lng);
+  current.bng = fmtBNG(lat, lng);
+
+  vDD.textContent  = current.dd;
+  vDMS.textContent = current.dms;
+  vBNG.textContent = current.bng || "Outside BNG area";
+  vBNG.classList.toggle("na", !current.bng);
+}
+
+if (!TOUCH) {
+  map.on("mousemove", e => {
+    updateReadout(e.latlng);
+    // crosshair guides track the pointer (containerPoint is relative to #map,
+    // which is fixed at 0,0 so it equals the viewport position here)
+    chH.style.top  = e.containerPoint.y + "px";
+    chV.style.left = e.containerPoint.x + "px";
+    document.body.classList.add("ch-active");
+  });
+  map.on("mouseout", () => document.body.classList.remove("ch-active"));
+} else {
+  vDD.textContent = "— tap the map";
+}
+
+let toastTimer = null;
+function copyText(text) {
+  const done = ok => {
+    toast.textContent = ok ? "Copied" : "Copy failed";
+    toast.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toast.classList.remove("show"), 900);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => done(true), () => done(false));
+  } else {
+    // fallback for older browsers / non-secure contexts
+    const ta = document.createElement("textarea");
+    ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch (_) {}
+    ta.remove(); done(ok);
+  }
+}
+
+document.querySelectorAll("#coords .row").forEach(row => {
+  row.addEventListener("click", () => {
+    const v = current[row.dataset.copy];
+    if (v) copyText(v);
+  });
+});
+
+/* ================= pins & elevation ================= */
+
+const pinsGroup = L.layerGroup().addTo(map);
+const pinFoot = document.getElementById("pinFoot");
+const pinCount = document.getElementById("pinCount");
+let pinTotal = 0, pinId = 0;
+
+const pinIcon = L.divIcon({
+  className: "",                 // suppress Leaflet's default divIcon styling
+  html: '<div class="pin"></div>',
+  iconSize: [14, 14],
+  iconAnchor: [7, 7],            // centre-anchored: the pin sits ON the point
+});
+
+function refreshPinFoot() {
+  pinCount.textContent = pinTotal + (pinTotal === 1 ? " pin" : " pins");
+  pinFoot.classList.toggle("show", pinTotal > 0);
+}
+
+// Build popup DOM by hand (no innerHTML for values) so rows can copy on click
+function buildPopup(lat, lng, id) {
+  const wrap = document.createElement("div");
+  wrap.className = "pop";
+  const rows = [
+    ["DD",   fmtDD(lat, lng)],
+    ["DMS",  fmtDMS(lat, lng)],
+    ["BNG",  fmtBNG(lat, lng) || "Outside BNG area"],
+  ];
+  rows.forEach(([lab, val]) => {
+    const r = document.createElement("div");
+    r.className = "row";
+    r.title = "Click to copy";
+    const l = document.createElement("span"); l.className = "lab"; l.textContent = lab;
+    const v = document.createElement("span"); v.className = "val"; v.textContent = val;
+    r.append(l, v);
+    if (val !== "Outside BNG area") r.addEventListener("click", () => copyText(val));
+    wrap.appendChild(r);
+  });
+  const er = document.createElement("div");
+  er.className = "row";
+  const el = document.createElement("span"); el.className = "lab"; el.textContent = "ELEV";
+  const ev = document.createElement("span"); ev.className = "val elev";
+  ev.id = "elev-" + id; ev.textContent = "Loading elevation…";
+  er.append(el, ev);
+  wrap.appendChild(er);
+  return wrap;
+}
+
+// Open-Elevation: free, no key. Can be slow — abort after 8 s and fail softly.
+async function fetchElevation(lat, lng, id) {
+  const out = () => document.getElementById("elev-" + id); // popup may have closed
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const url = "https://api.open-elevation.com/api/v1/lookup?locations=" +
+                lat.toFixed(6) + "," + lng.toFixed(6);
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    const elev = data && data.results && data.results[0] && data.results[0].elevation;
+    const node = out();
+    if (node) node.textContent = (typeof elev === "number")
+      ? Math.round(elev) + " m a.s.l." : "Elevation unavailable";
+  } catch (_) {
+    const node = out();
+    if (node) node.textContent = "Elevation unavailable";
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+map.on("click", e => {
+  updateReadout(e.latlng);                     // touch devices: tap = readout too
+  const id = ++pinId;
+  const m = L.marker(e.latlng, { icon: pinIcon, keyboard: false }).addTo(pinsGroup);
+  m.bindPopup(buildPopup(e.latlng.lat, e.latlng.lng, id), { minWidth: 235 });
+  m.openPopup();
+  pinTotal++;
+  refreshPinFoot();
+  fetchElevation(e.latlng.lat, e.latlng.lng, id);
+});
+
+document.getElementById("clearPins").addEventListener("click", () => {
+  pinsGroup.clearLayers();
+  pinTotal = 0;
+  refreshPinFoot();
+});
+
+/* ================= search (Nominatim) ================= */
+/*
+  Nominatim usage policy (https://operations.osmfoundation.org/policies/nominatim/):
+  max 1 request/second, identify your application, no autocomplete-per-keystroke.
+  We debounce 600 ms, require ≥3 chars, cap at 5 results, and the browser's
+  Referer header identifies this page. For a publicly hosted deployment add
+  "&email=you@example.com" to the URL below.
+*/
+const qInput = document.getElementById("q");
+const resultsEl = document.getElementById("results");
+let debounceTimer = null, lastQuery = "", searchAbort = null;
+
+function clearResults() { resultsEl.innerHTML = ""; }
+
+function showMessage(text) {
+  clearResults();
+  const li = document.createElement("li");
+  li.className = "msg"; li.textContent = text;
+  resultsEl.appendChild(li);
+}
+
+async function runSearch(q) {
+  if (searchAbort) searchAbort.abort();
+  searchAbort = new AbortController();
+  lastQuery = q;
+  showMessage("Searching…");
+  try {
+    const url = "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&accept-language=en&q="
+              + encodeURIComponent(q);
+    const res = await fetch(url, { signal: searchAbort.signal });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    if (q !== lastQuery) return;             // a newer search superseded this one
+    clearResults();
+    if (!data.length) { showMessage("No results"); return; }
+    data.forEach(place => {
+      const li = document.createElement("li");
+      li.setAttribute("role", "option");
+      li.tabIndex = 0;
+      const name = document.createElement("span");
+      name.textContent = place.display_name;
+      const type = document.createElement("span");
+      type.className = "type";
+      type.textContent = (place.type || "").replace(/_/g, " ");
+      li.append(name, type);
+      const go = () => {
+        clearResults();
+        qInput.blur();
+        const animate = !REDUCED;
+        if (place.boundingbox) {
+          const [s, n, w, e2] = place.boundingbox.map(Number);
+          map.fitBounds([[s, w], [n, e2]], { animate, maxZoom: 15 });
+        } else {
+          map.setView([+place.lat, +place.lon], 13, { animate });
+        }
+      };
+      li.addEventListener("click", go);
+      li.addEventListener("keydown", ev => { if (ev.key === "Enter") go(); });
+      resultsEl.appendChild(li);
+    });
+  } catch (err) {
+    if (err.name !== "AbortError") showMessage("Search failed — try again");
+  }
+}
+
+qInput.addEventListener("input", () => {
+  clearTimeout(debounceTimer);
+  const q = qInput.value.trim();
+  if (q.length < 3) { clearResults(); return; }
+  debounceTimer = setTimeout(() => runSearch(q), 600);
+});
+qInput.addEventListener("keydown", e => {
+  if (e.key === "Enter") {
+    clearTimeout(debounceTimer);
+    const q = qInput.value.trim();
+    if (q.length >= 2) runSearch(q);
+  } else if (e.key === "Escape") {
+    clearResults(); qInput.blur();
+  }
+});
+
+/* ================= help & keyboard shortcuts ================= */
+
+const helpBtn = document.getElementById("helpBtn");
+const helpPanel = document.getElementById("help");
+
+function setHelp(open) {
+  helpPanel.classList.toggle("open", open);
+  helpBtn.setAttribute("aria-expanded", String(open));
+}
+helpBtn.addEventListener("click", () => setHelp(!helpPanel.classList.contains("open")));
+document.getElementById("helpClose").addEventListener("click", () => setHelp(false));
+
+document.addEventListener("keydown", e => {
+  if (introActive) return;                   // intro screen owns the keyboard first
+  const typing = /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName);
+
+  if (e.key === "Escape") {
+    setHelp(false); clearResults(); map.closePopup();
+    if (typing) document.activeElement.blur();
+    return;
+  }
+  if (typing) return;                        // don't hijack keys while typing
+
+  if (e.key === "/") { e.preventDefault(); qInput.focus(); qInput.select(); }
+  else if (e.key >= "1" && e.key <= "5") setBaseLayer(+e.key - 1);
+  else if (e.key === "c" || e.key === "C") { pinsGroup.clearLayers(); pinTotal = 0; refreshPinFoot(); }
+  else if (e.key === "x" || e.key === "X") document.body.classList.toggle("ch-on");
+  else if (e.key === "?") setHelp(!helpPanel.classList.contains("open"));
+});
+
+/* ================= GeoMiner intro: rotating deposit globe ================= */
+/*
+  A self-contained canvas globe: an evenly distributed point-sphere (the world)
+  slowly rotating on a tilted axis, with a handful of famous mineral deposits
+  marked as glowing amber points that "ping". Purely decorative — no data feed —
+  and it stops its animation loop the moment the visitor enters the map.
+*/
+(function initIntro() {
+  const intro   = document.getElementById("intro");
+  const canvas  = document.getElementById("globe");
+  const enterBtn = document.getElementById("enterMap");
+  if (!intro || !canvas || !enterBtn) return;
+  const ctx = canvas.getContext("2d");
+  const DPR = Math.min(window.devicePixelRatio || 1, 2);
+
+  let W = 0, H = 0, cx = 0, cy = 0, R = 0, raf = null, running = true;
+  const TILT = -0.34;                        // axial tilt (radians)
+
+  // --- evenly spread base points via a Fibonacci sphere ---
+  const N = 820, base = [];
+  const gold = Math.PI * (3 - Math.sqrt(5));
+  for (let i = 0; i < N; i++) {
+    const y = 1 - (i / (N - 1)) * 2;
+    const r = Math.sqrt(1 - y * y);
+    const th = gold * i;
+    base.push([Math.cos(th) * r, y, Math.sin(th) * r]);
+  }
+
+  // --- famous mineral deposits (lat, lng) → unit vectors ---
+  const DEPOSITS = [
+    [67.85, 20.22], [40.52, -112.15], [-26.4, 27.4], [-24.27, -69.07],
+    [-6.06, -50.16], [-30.44, 136.88], [-30.75, 121.47], [69.35, 88.2],
+    [-20.72, 139.5], [-4.06, 137.11], [46.5, -81.0], [-22.3, -68.9],
+    [-31.95, 141.45], [-25.0, 29.0], [43.0, 106.86], [50.2, -5.3],
+  ];
+  const dep = DEPOSITS.map(([la, lo]) => {
+    const phi = la * Math.PI / 180, lam = lo * Math.PI / 180;
+    return [Math.cos(phi) * Math.cos(lam), Math.sin(phi), Math.cos(phi) * Math.sin(lam)];
+  });
+
+  function resize() {
+    W = intro.clientWidth; H = intro.clientHeight;
+    canvas.width = W * DPR; canvas.height = H * DPR;
+    canvas.style.width = W + "px"; canvas.style.height = H + "px";
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    cx = W / 2; cy = H * 0.54;
+    R = Math.min(W, H) * (W < 620 ? 0.34 : 0.31);
+  }
+
+  // rotate point about Y (spin) then about X (axial tilt)
+  function project(p, a) {
+    const x = p[0] * Math.cos(a) - p[2] * Math.sin(a);
+    const z = p[0] * Math.sin(a) + p[2] * Math.cos(a);
+    const y = p[1];
+    const y2 = y * Math.cos(TILT) - z * Math.sin(TILT);
+    const z2 = y * Math.sin(TILT) + z * Math.cos(TILT);
+    return [cx + x * R, cy - y2 * R, z2];    // screenX, screenY, depth(-1..1)
+  }
+
+  const t0 = performance.now();
+  function frame(now) {
+    const t = (now - t0) / 1000;
+    const a = REDUCED ? 0.6 : t * 0.16;
+    ctx.clearRect(0, 0, W, H);
+
+    // soft atmospheric glow around the sphere
+    const g = ctx.createRadialGradient(cx, cy, R * 0.2, cx, cy, R * 1.28);
+    g.addColorStop(0, "rgba(20,110,92,0.12)");
+    g.addColorStop(1, "rgba(20,110,92,0)");
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(cx, cy, R * 1.28, 0, 7); ctx.fill();
+
+    // base point-sphere (front points brighter/larger)
+    for (let i = 0; i < N; i++) {
+      const [sx, sy, dz] = project(base[i], a);
+      const depth = (dz + 1) / 2;
+      ctx.fillStyle = `rgba(150,214,199,${0.10 + depth * 0.5})`;
+      ctx.beginPath(); ctx.arc(sx, sy, 0.5 + depth * 1.3, 0, 7); ctx.fill();
+    }
+
+    // deposit markers (front hemisphere only)
+    for (let i = 0; i < dep.length; i++) {
+      const [sx, sy, dz] = project(dep[i], a);
+      if (dz <= -0.05) continue;
+      const depth = (dz + 1) / 2;
+      const hr = 6 + depth * 6;
+      const hg = ctx.createRadialGradient(sx, sy, 0, sx, sy, hr);
+      hg.addColorStop(0, `rgba(245,201,107,${0.2 + depth * 0.5})`);
+      hg.addColorStop(1, "rgba(245,201,107,0)");
+      ctx.fillStyle = hg;
+      ctx.beginPath(); ctx.arc(sx, sy, hr, 0, 7); ctx.fill();
+
+      ctx.fillStyle = `rgba(255,224,150,${0.6 + depth * 0.4})`;
+      ctx.beginPath(); ctx.arc(sx, sy, 1.4 + depth * 1.6, 0, 7); ctx.fill();
+
+      if (!REDUCED) {                        // expanding "ping" ring
+        const ph = ((t * 0.6) + i * 0.37) % 1;
+        ctx.strokeStyle = `rgba(245,201,107,${(1 - ph) * 0.5 * depth})`;
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.arc(sx, sy, 2 + ph * (hr + 6), 0, 7); ctx.stroke();
+      }
+    }
+
+    if (running && !REDUCED) raf = requestAnimationFrame(frame);
+  }
+
+  window.addEventListener("resize", resize);
+  resize();
+  raf = requestAnimationFrame(frame);        // reduced-motion draws a single static frame
+
+  // --- hand off to the map ---
+  function enterApp() {
+    if (!introActive) return;
+    introActive = false;
+    intro.classList.add("leaving");
+    const finish = () => {
+      running = false;
+      if (raf) cancelAnimationFrame(raf);
+      window.removeEventListener("resize", resize);
+      document.removeEventListener("keydown", introKey, true);
+      intro.style.display = "none";
+      try { map.invalidateSize(); } catch (_) {}
+    };
+    if (REDUCED) finish(); else setTimeout(finish, 720);
+  }
+
+  function introKey(e) {
+    if (e.key === "Enter" || e.key === "Escape" || e.key === " ") {
+      e.preventDefault();
+      enterApp();
+    }
+  }
+
+  enterBtn.addEventListener("click", enterApp);
+  document.addEventListener("keydown", introKey, true);
+  // focus the CTA so keyboard users can enter immediately
+  try { enterBtn.focus({ preventScroll: true }); } catch (_) { enterBtn.focus(); }
+})();
+</script>
+</body>
+</html>
