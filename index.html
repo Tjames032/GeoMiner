@@ -326,8 +326,7 @@
   <div id="introContent">
     <p class="eyebrow anim d1">Global mineral deposit explorer</p>
     <h1>GeoMiner</h1>
-    <p class="sub anim d3">Explore mineral deposit sites across the world. Drop a pin
-       on any find to read its precise coordinates, elevation and the terrain beneath it.</p>
+    <p class="sub anim d3">Explore mineral deposit sites across the world.</p>
     <button id="enterMap" class="cta anim d4" type="button">
       Enter the map <span class="arrow" aria-hidden="true">&rarr;</span>
     </button>
@@ -406,13 +405,33 @@ const REDUCED = matchMedia("(prefers-reduced-motion: reduce)").matches;
 const TOUCH   = matchMedia("(pointer: coarse)").matches;
 let introActive = true;                     // true while the intro screen is showing
 
+// Google-Maps-style continuous world: latitude is fenced at the Web Mercator
+// projection limit (~±85.05) but longitude is left open, so the map scrolls
+// east–west forever. Tiles wrap seamlessly across the antimeridian and
+// worldCopyJump repositions the view onto the primary copy so pins stay visible.
+const LAT_FENCE = L.latLngBounds([[-85.05, -Infinity], [85.05, Infinity]]);
+
 const map = L.map("map", {
   center: [54.5, -3.0],          // over Great Britain so the BNG readout is live immediately
   zoom: 6,
+  minZoom: 2,                    // provisional floor — clampMinZoomToWorld() tightens it below
   zoomControl: !TOUCH,           // pinch-zoom replaces buttons on touch devices
   attributionControl: true,
+  worldCopyJump: true,           // crossing ±180° silently re-centres onto the primary world copy
+  maxBounds: LAT_FENCE,          // north/south fence only — east–west pans without end
+  maxBoundsViscosity: 1.0,       // the fence is solid — no elastic drag past the poles
 });
 map.attributionControl.setPrefix(false);
+
+// Stop the zoom-out where the world's *height* still fills the viewport — width no
+// longer matters because it wraps forever — so no white band appears above or below.
+function clampMinZoomToWorld() {
+  const fit = Math.max(1, Math.ceil(Math.log2(map.getSize().y / 256)));
+  map.setMinZoom(fit);
+  if (map.getZoom() < fit) map.setZoom(fit);
+}
+clampMinZoomToWorld();
+map.on("resize", clampMinZoomToWorld);
 
 const BASE_LAYERS = [
   { name: "OpenStreetMap", key: "1",
@@ -442,7 +461,7 @@ const layerButtons = [];
 const layersPanel = document.getElementById("layers");
 
 BASE_LAYERS.forEach((def, i) => {
-  def.layer = L.tileLayer(def.url, def.opts);
+  def.layer = L.tileLayer(def.url, def.opts);   // tiles wrap by default → seamless antimeridian
   const btn = document.createElement("button");
   btn.type = "button";
   btn.setAttribute("aria-pressed", "false");
@@ -610,7 +629,7 @@ const chV = document.getElementById("chV");
 const current = { dd: null, dms: null, bng: null };
 
 function updateReadout(latlng) {
-  const { lat, lng } = latlng;
+  const { lat, lng } = latlng.wrap();   // on a wrapped world copy, report real-world coords
   current.dd  = fmtDD(lat, lng);
   current.dms = fmtDMS(lat, lng);
   current.bng = fmtBNG(lat, lng);
@@ -736,13 +755,15 @@ async function fetchElevation(lat, lng, id) {
 
 map.on("click", e => {
   updateReadout(e.latlng);                     // touch devices: tap = readout too
+  const geo = e.latlng.wrap();                 // real-world coords even on a wrapped copy
   const id = ++pinId;
+  // marker stays at the clicked (unwrapped) spot so it lands under the cursor
   const m = L.marker(e.latlng, { icon: pinIcon, keyboard: false }).addTo(pinsGroup);
-  m.bindPopup(buildPopup(e.latlng.lat, e.latlng.lng, id), { minWidth: 235 });
+  m.bindPopup(buildPopup(geo.lat, geo.lng, id), { minWidth: 235 });
   m.openPopup();
   pinTotal++;
   refreshPinFoot();
-  fetchElevation(e.latlng.lat, e.latlng.lng, id);
+  fetchElevation(geo.lat, geo.lng, id);
 });
 
 document.getElementById("clearPins").addEventListener("click", () => {
