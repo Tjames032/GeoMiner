@@ -20,6 +20,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>GeoMiner</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><path d='M16 2 30 12 16 30 2 12Z' fill='%230b1211' stroke='%234fd6ae' stroke-width='2'/><path d='M16 2 30 12 16 30 2 12Z' fill='%234fd6ae' fill-opacity='.28'/><circle cx='16' cy='13' r='3.2' fill='%23baf6ff'/></svg>">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
       integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
 <style>
@@ -171,6 +172,25 @@
   #chH{height:1px;left:0;right:0}
   #chV{width:1px;top:0;bottom:0}
   body.ch-on.ch-active #chH,body.ch-on.ch-active #chV{display:block}
+
+  /* ---------- maker's mark (intro screen, bottom-left) ---------- */
+  #wm{
+    position:absolute;left:22px;bottom:18px;z-index:3;
+    font-family:var(--mono);font-size:10px;letter-spacing:.34em;
+    color:#5fd6b8;opacity:.5;pointer-events:none;user-select:none;
+  }
+
+  /* ---------- help: data sources ---------- */
+  #help .src{
+    margin-top:9px;padding-top:8px;border-top:1px solid var(--line);
+    font-size:10px;color:var(--ink2);line-height:1.55;
+  }
+  #help .src b{
+    display:block;font-size:9px;letter-spacing:.14em;text-transform:uppercase;
+    margin-bottom:3px;font-weight:600;
+  }
+  #help .src a{color:var(--accent);text-decoration:none}
+  #help .src a:hover{text-decoration:underline}
 
   /* ---------- pins & popups ---------- */
   .pin{
@@ -460,6 +480,7 @@
     </div>
   </div>
   <div id="introHint" class="anim d5" aria-hidden="true">Press Enter to begin</div>
+  <div id="wm" aria-hidden="true">T JAMES</div>
 </div>
 
 <div id="map" role="application" aria-label="Interactive map"></div>
@@ -531,10 +552,19 @@
     <tr><td><kbd>+</kbd> <kbd>−</kbd></td><td>Zoom in / out</td></tr>
     <tr><td><kbd>?</kbd></td><td>Show / hide this panel</td></tr>
     <tr><td><kbd>Esc</kbd></td><td>Close panels and popups</td></tr>
+    <tr><td><kbd>↑</kbd> <kbd>↓</kbd></td><td>Move through search results</td></tr>
   </table>
   <p>Search a mineral to light up every site that produces it; pick a mine to
      fly there and open its dossier. Click any coloured dot for details, or
-     click empty map to drop a coordinate pin. Click any coordinate row to copy it.</p>
+     click empty map to drop a coordinate pin. Click any coordinate row to copy it.
+     Double-click a legend entry to view that mineral alone. The address bar
+     always holds a shareable link to your current view.</p>
+  <div class="src">
+    <b>Data sources</b>
+    Facilities &amp; production: <a href="https://zenodo.org/records/7369478" target="_blank" rel="noopener">Jasansky et&nbsp;al. 2023</a> (CC&nbsp;BY&nbsp;4.0) ·
+    Mined-land footprints: <a href="https://doi.org/10.1594/PANGAEA.942325" target="_blank" rel="noopener">Maus et&nbsp;al. 2022</a> (CC&nbsp;BY&nbsp;4.0) ·
+    Basemaps: OpenStreetMap, CARTO, OpenTopoMap, Esri. Assembled by T&nbsp;James.
+  </div>
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
@@ -591,7 +621,10 @@ const BASE_LAYERS = [
       attribution: "Map data: &copy; OpenStreetMap contributors, SRTM | Style: &copy; <a href='https://opentopomap.org'>OpenTopoMap</a> (CC-BY-SA)" } },
   { name: "Esri World Imagery", key: "4",
     url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-    opts: { maxZoom: 19,
+    // Esri's hi-res imagery thins out past z17 in remote areas and serves
+    // "Map Data Not Available" placeholder tiles; maxNativeZoom makes deeper
+    // zooms upscale the z17 imagery instead of requesting missing tiles.
+    opts: { maxZoom: 19, maxNativeZoom: 17,
       attribution: "Imagery &copy; Esri, Maxar, Earthstar Geographics, and the GIS User Community" } },
   { name: "CartoDB Positron", key: "5",
     url: "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
@@ -836,26 +869,56 @@ function escHtml(s) {
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
 }
 
-// one colour per primary commodity — neon hues that bloom on the dark basemap
-const CAT_COLOR = {
-  "Coal":                  "#ff9f1a",   // hot ember — the biggest category must pop
-  "Gold":                  "#ffe83d",
-  "Iron":                  "#ff5c47",
-  "Copper":                "#2af5d9",
-  "Zinc":                  "#66b8ff",
-  "Nickel":                "#45f08c",
-  "Aluminium":             "#9db4ff",
-  "Silver":                "#f2f8ff",
-  "Processing":            "#9fb3bd",
-  "Other mine":            "#e6c98a",
-  "Other (poly)-metallic": "#c78bff",
-};
-const catColor = c => CAT_COLOR[c] || "#8fb0a8";
+/*
+  Canonical minerals: every site is scanned against these detectors (primary
+  commodity + full products text), so "Diamonds", "diamond", "Copper cathode"
+  etc. all resolve to the right mineral. A site can produce several (m.cats);
+  its display colour (m.cat) comes from its primary commodity when that maps
+  to a mineral, else the first produced mineral. Array order = display
+  priority; Silver sits last so byproduct silver doesn't claim polymetallic
+  mines (true silver mines still match via their primary commodity).
+*/
+const MINERALS = [
+  ["Coal",                "#ff9f1a", /coal|lignite|anthracite/i],
+  ["Iron",                "#ff5c47", /\biron\b|magnetite|hematite/i],
+  ["Copper",              "#2af5d9", /copper/i],
+  ["Gold",                "#ffe83d", /\bgold\b/i],
+  ["Zinc",                "#66b8ff", /zinc/i],
+  ["Nickel",              "#45f08c", /nickel/i],
+  ["Aluminium (Bauxite)", "#9db4ff", /alumin|bauxite/i],
+  ["Lead",                "#94a9c4", /\blead\b/i],
+  ["Molybdenum",          "#ff9fd0", /molybden/i],
+  ["Cobalt",              "#4d79ff", /cobalt/i],
+  ["Platinum group",      "#b984ff", /platinum|palladium|rhodium|\bpgm\b/i],
+  ["Manganese",           "#8d6bff", /manganese/i],
+  ["Mineral sands",       "#d4f56e", /ilmenite|rutile|zircon/i],
+  ["Phosphate",           "#a8ffd0", /phosphate|phosphorus/i],
+  ["Diamonds",            "#baf6ff", /diamond/i],
+  ["Tin",                 "#ffd0a1", /\btin\b/i],
+  ["Uranium",             "#c8ff4d", /uranium|u3o8/i],
+  ["Chromium",            "#8fe86f", /chrom/i],
+  ["Silver",              "#f2f8ff", /silver/i],
+];
+const MINERAL_COLOR = {};
+MINERALS.forEach(([n, c]) => { MINERAL_COLOR[n] = c; });
+MINERAL_COLOR["Processing"] = "#7a919b";
+MINERAL_COLOR["Other"] = "#8fb0a8";
+const catColor = c => MINERAL_COLOR[c] || "#8fb0a8";
+
+MINES.forEach(m => {
+  const hay = m.commodity + " " + (m.products || "");
+  m.cats = [];
+  MINERALS.forEach(([name, , re]) => { if (re.test(hay)) m.cats.push(name); });
+  const prim = MINERALS.find(([, , re]) => re.test(m.commodity));
+  m.cat = prim ? prim[0]
+        : m.cats.length ? m.cats[0]
+        : m.commodity === "Processing" ? "Processing" : "Other";
+});
 
 // categories ordered by site count — drives the legend
 const CATS = (() => {
   const n = {};
-  MINES.forEach(m => { n[m.commodity] = (n[m.commodity] || 0) + 1; });
+  MINES.forEach(m => { n[m.cat] = (n[m.cat] || 0) + 1; });
   return Object.keys(n).sort((a, b) => n[b] - n[a])
     .map(k => ({ key: k, count: n[k] }));
 })();
@@ -873,14 +936,15 @@ const baseRadius = () => map.getZoom() >= 7 ? 6 : map.getZoom() >= 5 ? 5 : 4;
 
 function mineMatchesFilter(m) {
   if (!mineralFilter) return true;
-  return m.commodity.toLowerCase().includes(mineralFilter) ||
-         (m.products || "").toLowerCase().includes(mineralFilter);
+  if (mineralFilter.cat) return m.cats.includes(mineralFilter.cat);
+  return m.commodity.toLowerCase().includes(mineralFilter.term) ||
+         (m.products || "").toLowerCase().includes(mineralFilter.term);
 }
 
 function styleFor(mk) {
   const m = mk.mine;
   const dim = mineralFilter && !mineMatchesFilter(m);
-  const col = catColor(m.commodity);
+  const col = catColor(m.cat);
   const sel = mk === selectedMk;
   // same-hue wide translucent stroke reads as a soft glow on the dark basemap
   return {
@@ -901,14 +965,14 @@ map.on("zoomend", restyleAll);
 function mineTip(m) {
   const sub = m.sub && m.sub !== m.name ? " · " + m.sub : "";
   return "<b>" + escHtml(m.name + sub) + "</b><br><span class=\"tt-sub\">" +
-         escHtml([m.commodity, m.country].filter(Boolean).join(" · ")) + "</span>";
+         escHtml([m.cat, m.country].filter(Boolean).join(" · ")) + "</span>";
 }
 
 MINES.forEach(m => {
   const mk = L.circleMarker([m.lat, m.lng], {
     renderer: mineRenderer, keyboard: false,
-    radius: 4, weight: 5, color: catColor(m.commodity), opacity: 0.38,
-    fillColor: catColor(m.commodity), fillOpacity: 1,
+    radius: 4, weight: 5, color: catColor(m.cat), opacity: 0.38,
+    fillColor: catColor(m.cat), fillOpacity: 1,
   });
   mk.mine = m;
   m.marker = mk;
@@ -951,7 +1015,7 @@ const POLYS = POLYS_RAW.map(rec => {
     for (let i = 0; i < flat.length; i += 2) ring.push([flat[i], flat[i + 1]]);
     rings.push(ring);
   }
-  const col = catColor(MINES[fi].commodity);
+  const col = catColor(MINES[fi].cat);
   const pg = L.polygon(rings, {
     renderer: mineRenderer, keyboard: false, interactive: false,
     color: col, weight: 1.3, opacity: 0.8, dashArray: "4 3",
@@ -962,7 +1026,7 @@ const POLYS = POLYS_RAW.map(rec => {
 
 function polyVisible(p) {
   const m = MINES[p.fi];
-  return catVisible[m.commodity] !== false &&
+  return catVisible[m.cat] !== false &&
          (!mineralFilter || mineMatchesFilter(m));
 }
 
@@ -995,6 +1059,7 @@ function selectMine(m, { fly = true } = {}) {
   selectedMk.setStyle(styleFor(selectedMk));
   selectedMk.bringToFront();
   openFacilityPanel(m);
+  updateHash();
   if (fly && !REDUCED) {
     map.flyTo([m.lat, m.lng], Math.max(map.getZoom(), 9),
               { duration: flyDuration(L.latLng(m.lat, m.lng)), easeLinearity: 0.2 });
@@ -1031,7 +1096,7 @@ function fpSection(label) {
 }
 
 function openFacilityPanel(m) {
-  fpanel.style.setProperty("--c", catColor(m.commodity));
+  fpanel.style.setProperty("--c", catColor(m.cat));
   fpKick.textContent = [m.type || "Facility", m.status].filter(Boolean).join(" · ");
   fpName.textContent = m.name + (m.sub && m.sub !== m.name ? " — " + m.sub : "");
   fpSub.textContent  = m.country || "";
@@ -1042,10 +1107,10 @@ function openFacilityPanel(m) {
   const chips = document.createElement("div");
   chips.className = "chips";
   const prim = document.createElement("span");
-  prim.className = "chip prim"; prim.textContent = m.commodity;
+  prim.className = "chip prim"; prim.textContent = m.cat;
   chips.appendChild(prim);
   (m.products || "").split(/[,;]/).map(s => s.trim())
-    .filter(p => p && p.toLowerCase() !== m.commodity.toLowerCase())
+    .filter(p => p && p.toLowerCase() !== m.cat.toLowerCase())
     .forEach(p => {
       const c = document.createElement("span");
       c.className = "chip"; c.textContent = p;
@@ -1087,6 +1152,7 @@ function closeFacilityPanel() {
   fpanel.classList.remove("open");
   fpanel.setAttribute("aria-hidden", "true");
   if (selectedMk) { const prev = selectedMk; selectedMk = null; prev.setStyle(styleFor(prev)); }
+  updateHash();
 }
 document.getElementById("fpClose").addEventListener("click", closeFacilityPanel);
 
@@ -1094,10 +1160,11 @@ document.getElementById("fpClose").addEventListener("click", closeFacilityPanel)
 const filterbar = document.getElementById("filterbar");
 
 function setMineralFilter(term, label) {
-  mineralFilter = term.toLowerCase();
+  // canonical mineral → robust category match; anything else → text match
+  mineralFilter = MINERAL_COLOR[label] ? { cat: label } : { term: term.toLowerCase() };
   const matches = MINES.filter(mineMatchesFilter);
   if (!matches.length) { clearMineralFilter(); return; }
-  filterbar.style.setProperty("--c", CAT_COLOR[label] || "var(--accent)");
+  filterbar.style.setProperty("--c", catColor(label));
   document.getElementById("fbName").textContent = label;
   document.getElementById("fbCount").textContent =
     matches.length + (matches.length === 1 ? " site" : " sites");
@@ -1119,15 +1186,21 @@ function clearMineralFilter() {
 }
 document.getElementById("fbClear").addEventListener("click", clearMineralFilter);
 
-/* --- searchable mineral index: primary commodities + everything in
-       "commodities produced", counted once per site --- */
+/* --- searchable mineral index: canonical minerals first (robust to
+       plural/singular and product variants), then any leftover raw terms
+       no canonical mineral covers --- */
 const MINERAL_INDEX = (() => {
   const idx = new Map();                 // lowercase term → {label, count}
+  MINERALS.forEach(([name]) => {
+    const count = MINES.reduce((n, m) => n + m.cats.includes(name), 0);
+    if (count) idx.set(name.toLowerCase(), { label: name, count });
+  });
   MINES.forEach(m => {
     const seen = new Set();
     const add = raw => {
       const label = raw.trim();
       if (!label || label.length < 3) return;
+      if (MINERALS.some(([, , re]) => re.test(label))) return;  // covered above
       const k = label.toLowerCase();
       if (seen.has(k)) return;
       seen.add(k);
@@ -1143,23 +1216,46 @@ const MINERAL_INDEX = (() => {
 
 /* --- legend: swatch + count per commodity, click to hide/show --- */
 const legendPanel = document.getElementById("legend");
+const legendBtns = {};
+let soloCat = null;                    // legend "solo" mode: one mineral alone
+
+function syncLegend() {
+  CATS.forEach(({ key }) => {
+    legendBtns[key].setAttribute("aria-pressed", String(catVisible[key]));
+  });
+  MINES.forEach(m => {
+    if (catVisible[m.cat]) m.marker.addTo(mineGroup);
+    else mineGroup.removeLayer(m.marker);
+  });
+  refreshPolys();
+}
+
 CATS.forEach(({ key, count }) => {
   const btn = document.createElement("button");
   btn.type = "button";
   btn.setAttribute("aria-pressed", "true");
   btn.style.setProperty("--c", catColor(key));
+  btn.title = "Click: show / hide · Double-click: only " + key;
   btn.innerHTML = "<span class=\"sw\"></span><span class=\"nm\">" + escHtml(key) +
                   "</span><span class=\"ct\">" + count + "</span>";
   btn.addEventListener("click", () => {
+    soloCat = null;
     catVisible[key] = !catVisible[key];
-    btn.setAttribute("aria-pressed", String(catVisible[key]));
-    MINES.forEach(m => {
-      if (m.commodity !== key) return;
-      if (catVisible[key]) m.marker.addTo(mineGroup);
-      else mineGroup.removeLayer(m.marker);
-    });
-    refreshPolys();
+    syncLegend();
   });
+  // double-click solos the mineral (the two clicks before it cancel out);
+  // double-clicking the soloed entry restores everything
+  btn.addEventListener("dblclick", () => {
+    if (soloCat === key) {
+      soloCat = null;
+      CATS.forEach(c => { catVisible[c.key] = true; });
+    } else {
+      soloCat = key;
+      CATS.forEach(c => { catVisible[c.key] = c.key === key; });
+    }
+    syncLegend();
+  });
+  legendBtns[key] = btn;
   legendPanel.appendChild(btn);
 });
 
@@ -1254,7 +1350,7 @@ function renderLocal(q) {
     mins.forEach(e => addItem(
       e.label,
       e.count + (e.count === 1 ? " site" : " sites"),
-      CAT_COLOR[e.label] || "#6b7d80",
+      catColor(e.label),
       () => setMineralFilter(e.label.toLowerCase(), e.label)
     ));
   }
@@ -1262,8 +1358,8 @@ function renderLocal(q) {
     addGroup("Mines & facilities");
     facs.forEach(m => addItem(
       m.name + (m.sub && m.sub !== m.name ? " — " + m.sub : ""),
-      [m.commodity, m.country].filter(Boolean).join(" · "),
-      catColor(m.commodity),
+      [m.cat, m.country].filter(Boolean).join(" · "),
+      catColor(m.cat),
       () => selectMine(m, { fly: true })
     ));
   }
@@ -1314,12 +1410,26 @@ qInput.addEventListener("input", () => {
   }
 });
 
+function moveSelection(dir) {
+  const opts = [...resultsEl.querySelectorAll("li[role='option']")];
+  if (!opts.length) return;
+  let i = opts.findIndex(li => li.getAttribute("aria-selected") === "true");
+  if (i >= 0) opts[i].removeAttribute("aria-selected");
+  i = i < 0 ? (dir > 0 ? 0 : opts.length - 1) : (i + dir + opts.length) % opts.length;
+  opts[i].setAttribute("aria-selected", "true");
+  opts[i].scrollIntoView({ block: "nearest" });
+}
+
 qInput.addEventListener("keydown", e => {
-  if (e.key === "Enter") {
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    moveSelection(e.key === "ArrowDown" ? 1 : -1);
+  } else if (e.key === "Enter") {
     clearTimeout(debounceTimer);
-    // pick the first selectable result if one is showing
-    const first = resultsEl.querySelector("li[role='option']");
-    if (first) { first.click(); return; }
+    // pick the highlighted result, else the first one showing
+    const pick = resultsEl.querySelector("li[aria-selected='true']") ||
+                 resultsEl.querySelector("li[role='option']");
+    if (pick) { pick.click(); return; }
     const q = qInput.value.trim();
     if (q.length >= 2 && renderLocal(q) === 0 && q.length >= 3) runPlaceSearch(q);
   } else if (e.key === "Escape") {
@@ -1495,6 +1605,32 @@ document.addEventListener("keydown", e => {
   document.addEventListener("keydown", introKey, true);
   // focus the CTA so keyboard users can enter immediately
   try { enterBtn.focus({ preventScroll: true }); } catch (_) { enterBtn.focus(); }
+})();
+
+/* ================= permalink: the URL hash is a shareable view ================= */
+/*
+  #map=zoom/lat/lng[&mine=i] — updated on every move (replaceState, so the
+  back button isn't flooded) and restored on load. A link with a hash skips
+  the intro screen: whoever you sent it to lands straight on your view.
+*/
+function updateHash() {
+  const c = map.getCenter().wrap(), z = map.getZoom();
+  let h = "#map=" + z + "/" + c.lat.toFixed(4) + "/" + c.lng.toFixed(4);
+  if (selectedMk) h += "&mine=" + selectedMk.mine._i;
+  history.replaceState(null, "", h);
+}
+map.on("moveend", updateHash);
+
+(function restoreFromHash() {
+  const m = location.hash.match(/^#map=([\d.]+)\/(-?[\d.]+)\/(-?[\d.]+)(?:&mine=(\d+))?$/);
+  if (!m) return;
+  document.getElementById("enterMap").click();      // shared links skip the intro
+  // apply only after the intro handoff has finished (it calls invalidateSize
+  // at ~720 ms) — restoring mid-handoff collides with the first layout pass
+  setTimeout(() => {
+    map.setView([+m[2], +m[3]], +m[1], { animate: false });
+    if (m[4] != null && MINES[+m[4]]) selectMine(MINES[+m[4]], { fly: false });
+  }, REDUCED ? 60 : 820);
 })();
 </script>
 </body>
